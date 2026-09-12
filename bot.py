@@ -4,21 +4,28 @@ import subprocess
 import sys
 
 try:
+  import requests
   from bs4 import BeautifulSoup
   from playwright.sync_api import sync_playwright
 except ImportError:
   subprocess.run(
-      [sys.executable, "-m", "pip", "install", "playwright", "beautifulsoup4"],
+      [
+          sys.executable,
+          "-m",
+          "pip",
+          "install",
+          "requests",
+          "beautifulsoup4",
+          "playwright",
+      ],
       check=True,
   )
   subprocess.run(
       [sys.executable, "-m", "playwright", "install", "chromium"], check=True
   )
+  import requests
   from bs4 import BeautifulSoup
   from playwright.sync_api import sync_playwright
-  import requests
-else:
-  import requests
 
 TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -53,7 +60,6 @@ def telegram_foto_gonder(foto_url, caption):
     print(f"Telegram mesajı gönderilemedi: {e}")
 
 
-# Hafızayı yükle
 sent_links = []
 if os.path.exists(CACHE_FILE):
   try:
@@ -84,11 +90,6 @@ try:
     page.goto(URL, timeout=60000, wait_until="networkidle")
     page.wait_for_timeout(3000)
 
-    # Sekmeleri (Aktüel, İndirim, Kırtasiye vb.) ve Tarih butonlarını tek tek tıkla
-    # Sayfadaki olası kategori butonlarını ve tarih butonlarını bulup dolaşacağız
-    categories = page.locator(".tab-item, .category-item, button, a")
-
-    # Tüm sekmeleri ve tarihleri açmak için tıklama denemeleri
     try:
       tabs = page.locator("xpath=//*[contains(@class, 'tab') or contains(@class, 'category') or self::a]")
       count = tabs.count()
@@ -103,14 +104,12 @@ try:
     except Exception:
       pass
 
-    # Sayfadaki tüm resimleri topla
     html_content = page.content()
     browser.close()
 
   soup = BeautifulSoup(html_content, "html.parser")
   bulunan_resimler = []
 
-  # BİM afişlerinin orijinal yüksek kaliteli hallerini yakala (Genellikle büyük boy linkler veya img tagleri)
   for img in soup.find_all("img"):
     src = img.get("src") or img.get("data-src") or img.get("data-original")
     if not src:
@@ -124,24 +123,19 @@ try:
       continue
 
     lower_url = img_url.lower()
-    # Küçük ikon, logo vb. geç
     if any(
         k in lower_url
         for k in ["logo", "icon", "footer", "sosyal", "spacer", "banner"]
     ):
       continue
 
-    # Yüksek kalite için URL'deki küçük boyut parametrelerini temizleyebiliriz veya orijinali alırız
-    # Afişlerin ana dizinde veya Uploads klasöründe geçtiğinden emin olalım
     if "Uploads" in img_url or "katalog" in lower_url or "afis" in lower_url:
-      # Küçük resmi büyük boyuta çevir (varsa thb vb ifadeleri kaldır)
       high_res_url = (
           img_url.replace("_thumb", "")
           .replace("small_", "")
           .replace("/s/", "/l/")
       )
 
-      # Kategori/Sekme adını bulmaya çalışalım
       parent_text = ""
       try:
         parent = img.find_parent(class_=["tab", "content", "section", "div"])
@@ -159,7 +153,6 @@ try:
             "title": baslik_detay if baslik_detay else "Aktüel Ürünler",
         })
 
-  # Eğer yukarıdaki özel filtre az bulduysa, sayfadaki tüm büyük görselleri al
   if len(bulunan_resimler) < 2:
     for img in soup.find_all("img"):
       src = img.get("src") or img.get("data-src")

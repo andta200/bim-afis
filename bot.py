@@ -4,28 +4,26 @@ import subprocess
 import sys
 
 try:
-  import requests
   from bs4 import BeautifulSoup
+  from playwright.sync_api import sync_playwright
 except ImportError:
   subprocess.run(
-      [sys.executable, "-m", "pip", "install", "requests", "beautifulsoup4"],
+      [sys.executable, "-m", "pip", "install", "playwright", "beautifulsoup4"],
       check=True,
   )
-  import requests
+  subprocess.run(
+      [sys.executable, "-m", "playwright", "install", "chromium"], check=True
+  )
   from bs4 import BeautifulSoup
+  from playwright.sync_api import sync_playwright
+  import requests
+else:
+  import requests
 
 TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 URL = "https://www.bim.com.tr/Categories/680/afisler.aspx"
 CACHE_FILE = "sent_links.json"
-
-headers = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
-        " like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "tr-TR,tr;q=0.9",
-}
 
 
 def telegram_foto_gonder(foto_url, caption):
@@ -34,14 +32,17 @@ def telegram_foto_gonder(foto_url, caption):
     return
   api_url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
 
+  headers = {
+      "User-Agent": (
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+      )
+  }
   try:
-    # Afiş görselini indir
-    img_resp = requests.get(foto_url, headers=headers, timeout=15)
+    img_resp = requests.get(foto_url, headers=headers, timeout=20)
     if img_resp.status_code != 200:
       print(f"Resim indirilemedi: {foto_url}")
       return
 
-    # Telegram'a doğrudan fotoğraf olarak gönder
     files = {"photo": ("afis.jpg", img_resp.content, "image/jpeg")}
     data = {"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML"}
 
@@ -52,7 +53,7 @@ def telegram_foto_gonder(foto_url, caption):
     print(f"Telegram mesajı gönderilemedi: {e}")
 
 
-# Daha önce gönderilen afişlerin hafızasını yükle
+# Hafızayı yükle
 sent_links = []
 if os.path.exists(CACHE_FILE):
   try:
@@ -62,22 +63,59 @@ if os.path.exists(CACHE_FILE):
     sent_links = []
 
 try:
-  print(f"BİM afiş sayfasına bağlanılıyor: {URL}")
-  r = requests.get(URL, headers=headers, timeout=15)
-  if r.status_code != 200:
-    print(f"Hata: HTTP {r.status_code}")
-    sys.exit(1)
+  print("Playwright ile tüm sekmeler taranıyor...")
+  with sync_playwright() as p:
+    browser = p.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+        ],
+    )
+    page = browser.new_page(
+        viewport={"width": 1920, "height": 1080},
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            " (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+    )
 
-  soup = BeautifulSoup(r.text, "html.parser")
+    page.goto(URL, timeout=60000, wait_until="networkidle")
+    page.wait_for_timeout(3000)
+
+    # Sekmeleri (Aktüel, İndirim, Kırtasiye vb.) ve Tarih butonlarını tek tek tıkla
+    # Sayfadaki olası kategori butonlarını ve tarih butonlarını bulup dolaşacağız
+    categories = page.locator(".tab-item, .category-item, button, a")
+
+    # Tüm sekmeleri ve tarihleri açmak için tıklama denemeleri
+    try:
+      tabs = page.locator("xpath=//*[contains(@class, 'tab') or contains(@class, 'category') or self::a]")
+      count = tabs.count()
+      for i in range(min(count, 50)):
+        try:
+          t = tabs.nth(i)
+          if t.is_visible():
+            t.click(timeout=1000)
+            page.wait_for_timeout(1000)
+        except Exception:
+          pass
+    except Exception:
+      pass
+
+    # Sayfadaki tüm resimleri topla
+    html_content = page.content()
+    browser.close()
+
+  soup = BeautifulSoup(html_content, "html.parser")
   bulunan_resimler = []
 
-  # Sayfadaki tüm resim etiketlerini tara
+  # BİM afişlerinin orijinal yüksek kaliteli hallerini yakala (Genellikle büyük boy linkler veya img tagleri)
   for img in soup.find_all("img"):
-    src = img.get("src") or img.get("data-src")
+    src = img.get("src") or img.get("data-src") or img.get("data-original")
     if not src:
       continue
 
-    # Mutlak URL oluştur
     if src.startswith("/"):
       img_url = "https://www.bim.com.tr" + src
     elif src.startswith("http"):
@@ -85,54 +123,74 @@ try:
     else:
       continue
 
-    # Site logosu, ikon veya reklam görsellerini ele
     lower_url = img_url.lower()
+    # Küçük ikon, logo vb. geç
     if any(
-        kelime in lower_url
-        for kelime in [
-            "logo",
-            "icon",
-            "footer",
-            "sosyal",
-            "spacer",
-            "banner",
-            "header",
-        ]
+        k in lower_url
+        for k in ["logo", "icon", "footer", "sosyal", "spacer", "banner"]
     ):
       continue
 
-    alt_text = img.get("alt", "").strip()
+    # Yüksek kalite için URL'deki küçük boyut parametrelerini temizleyebiliriz veya orijinali alırız
+    # Afişlerin ana dizinde veya Uploads klasöründe geçtiğinden emin olalım
+    if "Uploads" in img_url or "katalog" in lower_url or "afis" in lower_url:
+      # Küçük resmi büyük boyuta çevir (varsa thb vb ifadeleri kaldır)
+      high_res_url = (
+          img_url.replace("_thumb", "")
+          .replace("small_", "")
+          .replace("/s/", "/l/")
+      )
 
-    if img_url not in [item["url"] for item in bulunan_resimler]:
-      bulunan_resimler.append({
-          "url": img_url,
-          "alt": alt_text if alt_text else "BİM Aktüel Afiş",
-      })
+      # Kategori/Sekme adını bulmaya çalışalım
+      parent_text = ""
+      try:
+        parent = img.find_parent(class_=["tab", "content", "section", "div"])
+        if parent:
+          parent_text = parent.get_text(" ", strip=True)[:30]
+      except Exception:
+        pass
 
-  # Sadece daha önce gönderilmemiş yeni afişleri seç
+      alt_text = img.get("alt", "").strip()
+      baslik_detay = alt_text if alt_text else parent_text
+
+      if high_res_url not in [item["url"] for item in bulunan_resimler]:
+        bulunan_resimler.append({
+            "url": high_res_url,
+            "title": baslik_detay if baslik_detay else "Aktüel Ürünler",
+        })
+
+  # Eğer yukarıdaki özel filtre az bulduysa, sayfadaki tüm büyük görselleri al
+  if len(bulunan_resimler) < 2:
+    for img in soup.find_all("img"):
+      src = img.get("src") or img.get("data-src")
+      if src and ("Uploads" in src or "Files" in src):
+        full_url = (
+            ("https://www.bim.com.tr" + src) if src.startswith("/") else src
+        )
+        if full_url not in [i["url"] for i in bulunan_resimler]:
+          bulunan_resimler.append({"url": full_url, "title": "BİM Afiş"})
+
   yeni_resimler = [
       item for item in bulunan_resimler if item["url"] not in sent_links
   ]
 
   if not yeni_resimler:
-    print("Yeni afiş fotoğrafı bulunamadı.")
+    print("Yeni afiş bulunamadı.")
     sys.exit(0)
 
-  print(f"{len(yeni_resimler)} adet yeni afiş bulundu, gönderiliyor...")
+  print(f"{len(yeni_resimler)} yeni yüksek kaliteli afiş işleniyor...")
 
-  for item in yeni_resimler:
-    caption = f"🛒 <b>BİM Yeni Afiş / Katalog</b>\n📌 {item['alt']}"
+  for idx, item in enumerate(yeni_resimler, 1):
+    caption = f"BİM | Afiş | {item['title']} ({idx}/{len(yeni_resimler)})"
     telegram_foto_gonder(item["url"], caption)
 
-    # Gönderilen resmi hafızaya ekle
     if item["url"] not in sent_links:
       sent_links.append(item["url"])
 
-  # Hafıza dosyasını güncelle
   with open(CACHE_FILE, "w", encoding="utf-8") as f:
     json.dump(sent_links, f, ensure_ascii=False, indent=2)
 
-  print("Tüm afişler başarıyla gönderildi ve hafızaya kaydedildi.")
+  print("Tüm afişler yüksek kalitede gönderildi.")
 
 except Exception as e:
   print(f"Kritik Hata: {e}")
